@@ -2,7 +2,7 @@ import os
 import pyodbc
 import pandas as pd
 from datetime import datetime
-from openpyxl.utils import get_column_letter
+import xlsxwriter
 
 # ==================== 配置区 ====================
 connStr = (
@@ -17,135 +17,166 @@ EXPORT_DIR = os.path.join(os.getcwd(), 'exports')
 
 # ==================== 辅助函数 ====================
 
-def fetch_paginated_data(sql, batch_size, max_batches, conn):
+def apply_mapping_and_fillna(df, header_mapping, fillna_dict):
+    """对DataFrame应用列头映射和基于原始字段的默认值填充"""
+    if df.empty:
+        return df
+    # 1. 空值填充（原始字段名）
+    if fillna_dict:
+        valid_fill = {col: val for col, val in fillna_dict.items() if col in df.columns}
+        if valid_fill:
+            df = df.fillna(valid_fill)
+    # 2. 列头映射
+    if header_mapping:
+        valid_map = {k: v for k, v in header_mapping.items() if k in df.columns}
+        if valid_map:
+            df = df.rename(columns=valid_map)
+    return df
+
+
+def write_batch_to_excel(worksheet, df, start_row, formats_dict=None):
     """
-    循环分页查询，返回合并后的DataFrame
-    参数:
-        sql: 带 {offset} 和 {page_size} 占位符的SQL
-        batch_size: 每批行数
-        max_batches: 最大循环次数
-        conn: 数据库连接
-    返回:
-        DataFrame，若无数据则返回空DataFrame
+    将DataFrame写入xlsxwriter的worksheet指定起始行
+    返回写入的行数
     """
-    df_list = []
-    offset = 0
-    for batch_num in range(1, max_batches + 1):
-        batch_sql = sql.format(offset=offset, page_size=batch_size)
-        batch_df = pd.read_sql(batch_sql, conn)
-        row_count = len(batch_df)
-        if row_count == 0:
-            break
-        df_list.append(batch_df)
-        if row_count < batch_size:   # 尾页检查：本次行数小于批次大小，结束
-            break
-        offset += batch_size
-
-    if df_list:
-        return pd.concat(df_list, ignore_index=True)
-    else:
-        return pd.DataFrame()
+    if df.empty:
+        return 0
+    # 如果还未写入表头，需在外部先写入
+    for row_idx, row in df.iterrows():
+        # row_idx是df的索引（0开始的相对索引），写入时加上start_row偏移
+        excel_row = start_row + row_idx
+        for col_idx, value in enumerate(row):
+            # 尝试使用预设格式，否则默认
+            cell_format = formats_dict.get(col_idx) if formats_dict else None
+            worksheet.write(excel_row, col_idx, value, cell_format)
+    return len(df)
 
 
-def adjust_column_width(worksheet, df):
-    """自动调整Excel列宽"""
-    for col_idx, column in enumerate(df.columns, start=1):
-        max_len = max(df[column].astype(str).map(len).max(), len(str(column))) + 2
-        max_len = min(max_len, 50)  # 限制最大宽度
-        col_letter = get_column_letter(col_idx)
-        worksheet.column_dimensions[col_letter].width = max_len
+def generate_output_filename(prefix="export"):
+    """生成带时间戳的文件名"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not os.path.exists(EXPORT_DIR):
+        os.makedirs(EXPORT_DIR)
+    return os.path.join(EXPORT_DIR, f"{prefix}_{timestamp}.xlsx")
 
 
-# ==================== 核心导出函数 ====================
+# ==================== 核心导出函数（流式） ====================
 
-def export_two_parts_to_excel(
+def export_large_data_to_excel(
     sql1,
     output_path,
     sql2=None,
     header_mapping1=None,
     header_mapping2=None,
-    fillna_dict1=None,             # 第一部分空值填充字典 {原始字段名: 填充值}
-    fillna_dict2=None,             # 第二部分空值填充字典 {原始字段名: 填充值}
-    batch_size1=1000,
-    batch_size2=1000,
-    max_batches=100,
-    sheet_name='Sheet1'
+    fillna_dict1=None,
+    fillna_dict2=None,
+    batch_size=10000,
+    max_batches=200,
+    sheet_name='Sheet1',
+    default_col_width=18       # 固定列宽，避免全量计算
 ):
     """
-    导出查询数据到Excel：可支持一部分或两部分横向拼接
-
-    参数:
-        sql1: 第一部分SQL，须包含 {offset} 和 {page_size} 占位符
-        output_path: 输出Excel文件路径
-        sql2: 第二部分SQL，默认None表示只导出一部分
-        header_mapping1: 第一部分列名映射字典 {原字段名: 显示名称}
-        header_mapping2: 第二部分列名映射字典
-        fillna_dict1: 第一部分空值填充字典 {原始字段名: 填充值}   <-- 使用原始列名
-        fillna_dict2: 第二部分空值填充字典 {原始字段名: 填充值}
-        batch_size1: 第一部分每批行数
-        batch_size2: 第二部分每批行数
-        max_batches: 最大循环批次数（防止死循环）
-        sheet_name: Excel工作表名称
+    流式导出大数据量查询到Excel，支持双SQL同步分页拼接
     """
     conn = None
     try:
         conn = pyodbc.connect(connStr)
+        workbook = xlsxwriter.Workbook(output_path, {'constant_memory': True})
+        worksheet = workbook.add_worksheet(sheet_name)
 
-        print("开始分批查询第一部分...")
-        df1 = fetch_paginated_data(sql1, batch_size1, max_batches, conn)
-        print(f"第一部分共 {len(df1)} 行，{len(df1.columns)} 列")
+        # 双模式标志
+        dual = (sql2 is not None)
 
-        df2 = pd.DataFrame()
-        if sql2:
-            print("开始分批查询第二部分...")
-            df2 = fetch_paginated_data(sql2, batch_size2, max_batches, conn)
-            print(f"第二部分共 {len(df2)} 行，{len(df2.columns)} 列")
-        else:
-            print("未提供第二部分SQL，仅导出第一部分数据。")
+        # 第一次先拉第一批数据，确定列头并写入
+        offset = 0
+        page_size = batch_size
 
-        # ---------- 1. 空值填充（基于原始字段名，在列头映射之前） ----------
-        if fillna_dict1 and not df1.empty:
-            # 只填充实际存在的列
-            fill_cols1 = {col: val for col, val in fillna_dict1.items() if col in df1.columns}
-            if fill_cols1:
-                df1 = df1.fillna(fill_cols1)
+        # 用于记录当前Excel已写入的行数（表头占第0行，数据从第1行开始）
+        current_data_row = 1
+        header_written = False
+        columns = []
 
-        if fillna_dict2 and not df2.empty:
-            fill_cols2 = {col: val for col, val in fillna_dict2.items() if col in df2.columns}
-            if fill_cols2:
-                df2 = df2.fillna(fill_cols2)
+        for batch_num in range(1, max_batches + 1):
+            # 查询第一部分
+            batch_sql1 = sql1.format(offset=offset, page_size=page_size)
+            df1 = pd.read_sql(batch_sql1, conn)
+            df2 = pd.DataFrame()
 
-        # ---------- 2. 应用列头映射 ----------
-        if header_mapping1 and not df1.empty:
-            valid_map1 = {k: v for k, v in header_mapping1.items() if k in df1.columns}
-            if valid_map1:
-                df1 = df1.rename(columns=valid_map1)
+            if dual:
+                batch_sql2 = sql2.format(offset=offset, page_size=page_size)
+                df2 = pd.read_sql(batch_sql2, conn)
+                # 检查行数是否一致（关键：确保拼接正确）
+                if len(df1) != len(df2):
+                    raise RuntimeError(
+                        f"批次 {batch_num} 两个查询行数不一致：第一部分 {len(df1)} 行，第二部分 {len(df2)} 行。"
+                        f"请确保两个SQL返回相同行数且顺序一致。"
+                    )
 
-        if header_mapping2 and not df2.empty:
-            valid_map2 = {k: v for k, v in header_mapping2.items() if k in df2.columns}
-            if valid_map2:
-                df2 = df2.rename(columns=valid_map2)
+            # 如果第一批，处理表头
+            if not header_written and (not df1.empty or (dual and not df2.empty)):
+                # 应用映射和填充
+                df1_processed = apply_mapping_and_fillna(df1.copy(), header_mapping1, fillna_dict1)
+                df2_processed = apply_mapping_and_fillna(df2.copy(), header_mapping2, fillna_dict2) if dual else pd.DataFrame()
 
-        # ---------- 3. 横向拼接 ----------
-        if df1.empty and df2.empty:
-            print("⚠️ 查询结果均为空，无数据导出")
-            return 0
+                # 拼接以获取最终列名
+                if dual:
+                    combined_head = pd.concat([df1_processed.head(0), df2_processed.head(0)], axis=1)
+                else:
+                    combined_head = df1_processed.head(0)
+                columns = list(combined_head.columns)
 
-        if df2.empty:
-            df_combined = df1
-        else:
-            df_combined = pd.concat([df1, df2], axis=1)
+                # 写入表头
+                for col_idx, col_name in enumerate(columns):
+                    worksheet.write(0, col_idx, col_name)
+                header_written = True
 
-        print(f"导出数据共 {len(df_combined)} 行，{len(df_combined.columns)} 列")
+            # 如果没有数据，退出循环
+            if df1.empty and (not dual or df2.empty):
+                break
 
-        # ---------- 4. 写入Excel ----------
-        print(f"正在写入 {output_path} ...")
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            df_combined.to_excel(writer, sheet_name=sheet_name, index=False)
-            adjust_column_width(writer.sheets[sheet_name], df_combined)
+            # 处理当前批次数据
+            if header_written:
+                # 应用映射和填充
+                df1_proc = apply_mapping_and_fillna(df1.copy(), header_mapping1, fillna_dict1)
+                df2_proc = apply_mapping_and_fillna(df2.copy(), header_mapping2, fillna_dict2) if dual else pd.DataFrame()
 
-        print(f"✅ 导出成功！保存至: {output_path}")
-        return len(df_combined)
+                if dual:
+                    batch_combined = pd.concat([df1_proc, df2_proc], axis=1)
+                else:
+                    batch_combined = df1_proc
+
+                # 确保列顺序与表头一致（避免因映射导致顺序问题）
+                batch_combined = batch_combined[columns]
+
+                # 写入数据
+                rows_written = write_batch_to_excel(
+                    worksheet, batch_combined, current_data_row, formats_dict=None
+                )
+                current_data_row += rows_written
+
+            # 判断是否为最后一批
+            if len(df1) < page_size:
+                break
+
+            offset += page_size
+
+        # 如果循环结束仍未写入任何头，说明全为空
+        if not header_written:
+            # 写入一个空的表头占位，避免文件损坏
+            worksheet.write(0, 0, "无数据")
+
+        # 设置列宽（统一固定宽度，简单高效）
+        if columns:
+            for col_idx in range(len(columns)):
+                worksheet.set_column(col_idx, col_idx, default_col_width)
+
+        workbook.close()
+        conn.close()
+        conn = None
+
+        total_rows = current_data_row - 1
+        print(f"✅ 导出完成！共 {total_rows} 行数据，文件: {output_path}")
+        return total_rows
 
     except Exception as e:
         print(f"❌ 导出失败: {e}")
@@ -157,24 +188,15 @@ def export_two_parts_to_excel(
             conn.close()
 
 
-# ==================== 便捷生成文件名 ====================
-
-def generate_output_filename(prefix="export"):
-    """生成带时间戳的文件名"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if not os.path.exists(EXPORT_DIR):
-        os.makedirs(EXPORT_DIR)
-    return os.path.join(EXPORT_DIR, f"{prefix}_{timestamp}.xlsx")
-
-
 # ==================== 主程序示例 ====================
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("两部分查询横向导出工具（支持单部分及基于原始字段的默认值填充）")
+    print("大数据量流式导出工具（内存友好）")
     print(f"开始时间: {datetime.now()}")
     print("=" * 70)
 
+    # SQL 示例（必须包含 {offset} 和 {page_size} 占位符，且两SQL行对应）
     sql_part1 = """
         SELECT
             BANK_IN_DATE,
@@ -202,14 +224,13 @@ if __name__ == "__main__":
         FETCH NEXT {page_size} ROWS ONLY
     """
 
-    # 列头映射（将原始字段名映射为中文显示名）
+    # 列头映射（原始字段 -> 显示名称）
     mapping1 = {
         'BANK_IN_DATE': '入账日期',
         'BANK_ACCOUNT_1': '银行账户',
         'CREDIT_DEBIT': '借贷标识',
         'AMOUNT': '金额'
     }
-
     mapping2 = {
         'RECORD_DETAILS': '交易详情',
         'ADDITIONAL_INFORMATION_1': '补充信息',
@@ -218,32 +239,30 @@ if __name__ == "__main__":
         'VERSION': '版本'
     }
 
-    # ✅ 空值填充字典：键必须使用【原始数据库字段名】，而非映射后的中文名
+    # 基于原始字段名的空值填充
     fillna1 = {
-        'BANK_ACCOUNT_1': '未知账户',   # 银行账户为空时填“未知账户”
-        'AMOUNT': 0                   # 金额为空时填0
+        'BANK_ACCOUNT_1': '未知账户',
+        'AMOUNT': 0
     }
     fillna2 = {
-        'RECORD_DETAILS': '无明细'     # 交易详情为空时填“无明细”
+        'RECORD_DETAILS': '无明细'
     }
 
-    # 生成输出路径
-    output_path = generate_output_filename("two_parts_export")
+    output_path = generate_output_filename("large_export")
 
-    # 调用导出函数
-    # 若只需导出第一部分，将 sql2 设为 None 即可
-    export_two_parts_to_excel(
+    # 单SQL导出模式：将 sql2 设为 None
+    export_large_data_to_excel(
         sql1=sql_part1,
         output_path=output_path,
-        sql2=sql_part2,                 # 改为 None 则仅导出第一部分
+        sql2=sql_part2,              # 若为 None 则仅导出第一部分
         header_mapping1=mapping1,
         header_mapping2=mapping2,
-        fillna_dict1=fillna1,           # 基于原始字段的默认值填充
+        fillna_dict1=fillna1,
         fillna_dict2=fillna2,
-        batch_size1=10000,
-        batch_size2=10000,
-        max_batches=200,
-        sheet_name='合并数据'
+        batch_size=10000,            # 每批1万行，可按内存调整
+        max_batches=500,             # 最大批次数，防止死循环
+        sheet_name='数据导出',
+        default_col_width=20
     )
 
     print("\n" + "=" * 70)
